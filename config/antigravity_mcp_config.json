@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "olist-postgres-mcp": {
+      "command": "D:\\Thuctap\\olist-mcp-agent\\olist-mcp-agent\\.venv\\Scripts\\python.exe",
+      "args": [
+        "server.py"
+      ],
+      "cwd": "D:\\Thuctap\\olist-mcp-agent\\olist-mcp-agent",
+      "env": {
+        "PGHOST": "localhost",
+        "PGPORT": "5432",
+        "PGDATABASE": "olist_db",
+        "PGUSER": "postgres",
+        "PGPASSWORD": "quang123",
+        "MAX_RETURN_ROWS": "200",
+        "DEFAULT_SCHEMA": "analytics"
+      }
+    }
+  }
+}

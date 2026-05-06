@@ -1,0 +1,11 @@
+.env
+.venv/
+.venv310/
+venv/
+__pycache__/
+*.pyc
+.agents/
+
+# Local data and generated artifacts
+data/
+report_favorite_products.html
