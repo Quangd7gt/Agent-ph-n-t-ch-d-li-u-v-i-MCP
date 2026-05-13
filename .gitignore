@@ -8,4 +8,5 @@ __pycache__/
 
 # Local data and generated artifacts
 data/
+*.log
 report_favorite_products.html

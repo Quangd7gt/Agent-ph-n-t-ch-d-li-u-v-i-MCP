@@ -4,7 +4,10 @@ import logging
 import os
 import re
 import sys
+import json
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +16,7 @@ from psycopg.rows import dict_row
 
 load_dotenv()
 DEFAULT_SCHEMA = os.getenv("DEFAULT_SCHEMA", "analytics")
+AGENT_API_URL = os.getenv("AGENT_API_URL", "http://127.0.0.1:8000/ask")
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stderr,
@@ -38,17 +42,27 @@ SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LEADING_SQL_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 LIMIT_RE = re.compile(r"\blimit\s+\d+\b", re.IGNORECASE)
 
-BUSINESS_RULES = {
-    "order_grain_definition": "analytics.fct_orders is one row per order_id.",
-    "order_item_grain_definition": "analytics.fct_order_items is one row per order_id + order_item_id.",
-    "revenue_definition": "Gross revenue is SUM(order_gross_value) from analytics.fct_orders for valid order statuses.",
-    "repeat_customer_definition": "A repeat customer is a customer_unique_id with at least 2 distinct orders.",
-    "delivery_delay_definition": "A delayed delivery is when order_delivered_customer_date > order_estimated_delivery_date.",
-    "valid_revenue_statuses": ["delivered", "shipped", "invoiced", "processing"],
-    "warning": "Do not sum payment_value_total from item-grain tables because it is an order-level measure."
-}
+def make_agent():
+    from agent.agent import OlistAgent
 
-VALID_REVENUE_STATUSES = ("delivered", "shipped", "invoiced", "processing")
+    return OlistAgent()
+
+
+def load_system_prompt() -> str:
+    return make_agent().load_system_prompt()
+
+
+def call_agent_api(question: str, output_path: str = "") -> dict[str, Any]:
+    payload = json.dumps({"question": question, "output_path": output_path}).encode("utf-8")
+    request = Request(
+        AGENT_API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=int(os.getenv("AGENT_API_TIMEOUT", "600"))) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
 
 
 def get_conn():
@@ -127,7 +141,38 @@ def ping() -> dict[str, Any]:
 @mcp.tool()
 def get_business_rules() -> dict[str, Any]:
     """Return business definitions that the agent should follow for analytics."""
-    return BUSINESS_RULES
+    return make_agent().get_business_rules()
+
+
+@mcp.prompt(
+    name="olist_data_analyst",
+    title="Olist Data Analyst System Prompt",
+    description="Instructions for using this MCP server as an Olist e-commerce data analyst.",
+)
+def olist_data_analyst_prompt() -> str:
+    """Return the Olist data analyst prompt from agent/system_prompt.txt."""
+    return load_system_prompt()
+
+
+@mcp.resource(
+    "prompt://olist/system",
+    name="olist_system_prompt",
+    title="Olist System Prompt",
+    description="The system prompt used by the Olist MCP data analyst agent.",
+    mime_type="text/markdown",
+)
+def olist_system_prompt_resource() -> str:
+    return load_system_prompt()
+
+
+@mcp.tool()
+def get_system_prompt() -> dict[str, Any]:
+    """Return the system prompt that should guide the Olist analytics agent."""
+    try:
+        return make_agent().get_system_prompt_info()
+    except Exception as exc:
+        logging.exception("Unable to load system prompt")
+        return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool()
@@ -291,132 +336,79 @@ def run_select_query(query: str, row_limit: int = 100) -> dict[str, Any]:
 @mcp.tool()
 def revenue_by_month(year: int) -> dict[str, Any]:
     """Return monthly gross revenue from analytics.fct_orders for a given year."""
-    start_date = f"{year}-01-01"
-    end_date = f"{year + 1}-01-01"
-    query = """
-    SELECT
-        date_trunc('month', order_purchase_timestamp) AS month,
-        SUM(order_gross_value) AS revenue,
-        COUNT(DISTINCT order_id) AS order_count
-    FROM analytics.fct_orders
-    WHERE order_purchase_timestamp >= %s
-      AND order_purchase_timestamp < %s
-      AND order_status = ANY(%s)
-    GROUP BY 1
-    ORDER BY 1;
-    """
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(query, (start_date, end_date, list(VALID_REVENUE_STATUSES)))
-            rows = cur.fetchall()
-        return {"ok": True, "year": year, "rows": rows}
+        agent = make_agent()
+        df = agent.analyze_revenue_by_month(year)
+        return {"ok": True, "year": year, "rows": agent.records(df)}
     except Exception as exc:
+        logging.exception("revenue_by_month failed")
         return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool()
 def top_categories(start_date: str, end_date: str, limit: int = 10) -> dict[str, Any]:
     """Return top product categories by gross revenue for a date range."""
-    limit = max(1, min(limit, 50))
-    query = """
-    SELECT
-        COALESCE(product_category_name_english, product_category_name, 'unknown') AS category,
-        SUM(line_total) AS revenue,
-        COUNT(DISTINCT order_id) AS order_count
-    FROM analytics.fct_order_items
-    WHERE order_purchase_timestamp::date BETWEEN %s::date AND %s::date
-      AND order_status = ANY(%s)
-    GROUP BY 1
-    ORDER BY revenue DESC
-    LIMIT %s;
-    """
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(query, (start_date, end_date, list(VALID_REVENUE_STATUSES), limit))
-            rows = cur.fetchall()
+        agent = make_agent()
+        limit = agent.clamp_limit(limit)
+        df = agent.analyze_top_categories(start_date, end_date, limit)
+        rows = agent.records(df)
         return {"ok": True, "start_date": start_date, "end_date": end_date, "limit": limit, "rows": rows}
     except Exception as exc:
+        logging.exception("top_categories failed")
         return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool()
 def delivery_delay_summary(start_date: str, end_date: str) -> dict[str, Any]:
     """Return delivery delay metrics for delivered orders within a date range."""
-    query = """
-    SELECT
-        COUNT(*) AS delivered_orders,
-        COUNT(*) FILTER (WHERE is_delayed_delivery IS TRUE) AS delayed_orders,
-        ROUND(
-            100.0 * COUNT(*) FILTER (WHERE is_delayed_delivery IS TRUE) / NULLIF(COUNT(*), 0),
-            2
-        ) AS delayed_order_rate_pct,
-        ROUND(AVG(delivery_days)::numeric, 2) AS avg_delivery_days,
-        ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score
-    FROM analytics.fct_orders
-    WHERE order_purchase_timestamp::date BETWEEN %s::date AND %s::date
-      AND order_status = 'delivered';
-    """
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(query, (start_date, end_date))
-            row = cur.fetchone()
+        agent = make_agent()
+        df = agent.analyze_delivery_delay_summary(start_date, end_date)
+        rows = agent.records(df)
+        row = rows[0] if rows else {}
         return {"ok": True, "start_date": start_date, "end_date": end_date, "summary": row}
     except Exception as exc:
+        logging.exception("delivery_delay_summary failed")
         return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool()
 def repeat_customer_rate(start_date: str, end_date: str) -> dict[str, Any]:
     """Return repeat customer rate using customer_unique_id and order grain."""
-    query = """
-    WITH customer_orders AS (
-        SELECT
-            customer_unique_id,
-            COUNT(DISTINCT order_id) AS order_count
-        FROM analytics.fct_orders
-        WHERE order_purchase_timestamp::date BETWEEN %s::date AND %s::date
-          AND order_status = ANY(%s)
-          AND customer_unique_id IS NOT NULL
-        GROUP BY 1
-    )
-    SELECT
-        COUNT(*) AS active_customers,
-        COUNT(*) FILTER (WHERE order_count >= 2) AS repeat_customers,
-        ROUND(
-            100.0 * COUNT(*) FILTER (WHERE order_count >= 2) / NULLIF(COUNT(*), 0),
-            2
-        ) AS repeat_customer_rate_pct
-    FROM customer_orders;
-    """
     try:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(query, (start_date, end_date, list(VALID_REVENUE_STATUSES)))
-            row = cur.fetchone()
+        agent = make_agent()
+        df = agent.analyze_repeat_customer_rate(start_date, end_date)
+        rows = agent.records(df)
+        row = rows[0] if rows else {}
         return {"ok": True, "start_date": start_date, "end_date": end_date, "summary": row}
     except Exception as exc:
+        logging.exception("repeat_customer_rate failed")
         return {"ok": False, "error": str(exc)}
 
 
 @mcp.tool()
-def suggest_analytics_queries() -> dict[str, Any]:
-    """Return example analytics questions and SQL patterns for the Olist database."""
-    return {
-        "examples": [
-            {
-                "question": "Doanh thu theo tháng trong năm 2018",
-                "sql_pattern": "SELECT date_trunc('month', order_purchase_timestamp) AS month, SUM(order_gross_value) AS revenue FROM analytics.fct_orders WHERE order_status IN ('delivered','shipped','invoiced','processing') AND order_purchase_timestamp >= '2018-01-01' AND order_purchase_timestamp < '2019-01-01' GROUP BY 1 ORDER BY 1"
-            },
-            {
-                "question": "Top 10 danh mục sản phẩm theo doanh thu trong quý 1 năm 2018",
-                "sql_pattern": "SELECT COALESCE(product_category_name_english, product_category_name, 'unknown') AS category, SUM(line_total) AS revenue FROM analytics.fct_order_items WHERE order_status IN ('delivered','shipped','invoiced','processing') AND order_purchase_timestamp >= '2018-01-01' AND order_purchase_timestamp < '2018-04-01' GROUP BY 1 ORDER BY revenue DESC LIMIT 10"
-            },
-            {
-                "question": "Tỷ lệ khách hàng quay lại trong năm 2018",
-                "sql_pattern": "WITH customer_orders AS (SELECT customer_unique_id, COUNT(DISTINCT order_id) AS order_count FROM analytics.fct_orders WHERE order_status IN ('delivered','shipped','invoiced','processing') AND order_purchase_timestamp >= '2018-01-01' AND order_purchase_timestamp < '2019-01-01' GROUP BY 1) SELECT COUNT(*) FILTER (WHERE order_count >= 2) * 100.0 / NULLIF(COUNT(*),0) AS repeat_rate_pct FROM customer_orders"
-            }
-        ]
-    }
+def gemma_runtime_status() -> dict[str, Any]:
+    """Return local Gemma runtime settings visible to the MCP server without loading the model."""
+    return make_agent().gemma_runtime_status()
 
+
+@mcp.tool()
+def gemma_agent(question: str, output_path: str = "") -> dict[str, Any]:
+    """Answer an Olist analytics question through the local long-running Gemma agent API."""
+    try:
+        return call_agent_api(question=question, output_path=output_path)
+    except URLError as exc:
+        logging.exception("Gemma agent API is unavailable")
+        return {
+            "ok": False,
+            "error": str(exc),
+            "agent_api_url": AGENT_API_URL,
+            "suggestion": "Start the agent API first with: python agent_api.py",
+        }
+    except Exception as exc:
+        logging.exception("Gemma agent failed")
+        return {"ok": False, "error": str(exc), "agent_api_url": AGENT_API_URL}
 def main() -> None:
     mcp.run(transport="stdio")
 
