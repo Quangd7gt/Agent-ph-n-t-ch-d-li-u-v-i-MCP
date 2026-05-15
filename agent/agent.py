@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any
 
 from dotenv import load_dotenv
@@ -64,6 +65,71 @@ class OlistAgent:
 
     def get_business_rules(self) -> dict[str, Any]:
         return BUSINESS_RULES
+
+    def answer_business_rule_question(self, question: str) -> dict[str, Any]:
+        q = self.normalize_text(question)
+        matched_rules: dict[str, Any] = {}
+        answer_parts: list[str] = []
+        intents: list[str] = []
+
+        if any(term in q for term in ["doanh thu", "revenue", "gross"]):
+            intents.append("revenue_rule")
+            matched_rules["revenue_definition"] = BUSINESS_RULES["revenue_definition"]
+            matched_rules["valid_revenue_statuses"] = BUSINESS_RULES["valid_revenue_statuses"]
+            matched_rules["warning"] = BUSINESS_RULES["warning"]
+            answer_parts.append(
+                "Doanh thu duoc tinh bang SUM(order_gross_value) tu analytics.fct_orders "
+                "cho cac trang thai hop le: delivered, shipped, invoiced, processing."
+            )
+
+        if any(term in q for term in ["grain", "cap do", "muc du lieu", "bang", "table", "fct_orders", "fct_order_items"]):
+            intents.append("table_grain_rule")
+            matched_rules["order_grain_definition"] = BUSINESS_RULES["order_grain_definition"]
+            matched_rules["order_item_grain_definition"] = BUSINESS_RULES["order_item_grain_definition"]
+            answer_parts.append(
+                "analytics.fct_orders co grain 1 dong cho moi order_id; "
+                "analytics.fct_order_items co grain 1 dong cho moi order_id + order_item_id."
+            )
+
+        if any(term in q for term in ["khach hang quay lai", "repeat", "returning customer", "mua lai"]):
+            intents.append("repeat_customer_rule")
+            matched_rules["repeat_customer_definition"] = BUSINESS_RULES["repeat_customer_definition"]
+            answer_parts.append(
+                "Khach hang quay lai la customer_unique_id co it nhat 2 don hang khac nhau."
+            )
+
+        if any(term in q for term in ["giao hang tre", "giao tre", "delay", "delayed", "tre"]):
+            intents.append("delivery_delay_rule")
+            matched_rules["delivery_delay_definition"] = BUSINESS_RULES["delivery_delay_definition"]
+            answer_parts.append(
+                "Don hang duoc coi la giao tre khi order_delivered_customer_date lon hon "
+                "order_estimated_delivery_date."
+            )
+
+        if any(term in q for term in ["payment", "thanh toan", "payment_value_total"]):
+            intents.append("payment_warning_rule")
+            matched_rules["warning"] = BUSINESS_RULES["warning"]
+            answer_parts.append(
+                "Khong cong payment_value_total tu bang item-grain vi day la chi so cap don hang "
+                "va co the bi lap so lieu."
+            )
+
+        if not matched_rules:
+            return {
+                "ok": True,
+                "intent": "all_business_rules",
+                "question": question,
+                "rules": BUSINESS_RULES,
+                "answer": "Khong tim thay nhom rule cu the, tra ve toan bo business rules dang duoc Agent su dung.",
+            }
+
+        return {
+            "ok": True,
+            "intent": "+".join(dict.fromkeys(intents)),
+            "question": question,
+            "rules": matched_rules,
+            "answer": " ".join(answer_parts),
+        }
 
     def get_schema(self, table: str) -> pd.DataFrame:
         query = text(
@@ -246,6 +312,341 @@ class OlistAgent:
             },
         )
 
+    def analyze_category_performance(self, year: int, top_n: int = 5) -> pd.DataFrame:
+        top_n = self.clamp_limit(top_n)
+        query = text(
+            f"""
+            WITH category_metrics AS (
+                SELECT
+                    COALESCE(product_category_name_english, product_category_name, 'unknown') AS category,
+                    SUM(line_total)::numeric AS revenue,
+                    COUNT(DISTINCT order_id) AS order_count,
+                    ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score
+                FROM {ANALYTICS_SCHEMA}.fct_order_items
+                WHERE order_purchase_timestamp >= :start_date
+                  AND order_purchase_timestamp < :end_date
+                  AND order_status IN :valid_statuses
+                GROUP BY 1
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN MAX(revenue) OVER () = MIN(revenue) OVER () THEN 1.0
+                        ELSE (revenue - MIN(revenue) OVER ()) / NULLIF(MAX(revenue) OVER () - MIN(revenue) OVER (), 0)
+                    END AS revenue_score,
+                    CASE
+                        WHEN MAX(order_count) OVER () = MIN(order_count) OVER () THEN 1.0
+                        ELSE (order_count - MIN(order_count) OVER ())::numeric
+                             / NULLIF(MAX(order_count) OVER () - MIN(order_count) OVER (), 0)
+                    END AS order_score,
+                    CASE
+                        WHEN MAX(COALESCE(avg_review_score, 0)) OVER () = MIN(COALESCE(avg_review_score, 0)) OVER () THEN 1.0
+                        ELSE (COALESCE(avg_review_score, 0) - MIN(COALESCE(avg_review_score, 0)) OVER ())
+                             / NULLIF(MAX(COALESCE(avg_review_score, 0)) OVER () - MIN(COALESCE(avg_review_score, 0)) OVER (), 0)
+                    END AS review_score
+                FROM category_metrics
+            )
+            SELECT
+                category,
+                ROUND(revenue, 2) AS revenue,
+                order_count,
+                avg_review_score,
+                ROUND((0.4 * revenue_score + 0.4 * order_score + 0.2 * review_score)::numeric, 4) AS performance_score
+            FROM scored
+            ORDER BY performance_score DESC, revenue DESC
+            LIMIT :top_n;
+            """
+        ).bindparams(bindparam("valid_statuses", expanding=True))
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+                "top_n": top_n,
+            },
+        )
+
+    def analyze_monthly_revenue_extremes(self, year: int) -> pd.DataFrame:
+        query = text(
+            f"""
+            SELECT
+                to_char(date_trunc('month', order_purchase_timestamp), 'YYYY-MM') AS month,
+                ROUND(SUM(order_gross_value)::numeric, 2) AS revenue,
+                COUNT(DISTINCT order_id) AS order_count,
+                ROUND(AVG(order_gross_value)::numeric, 2) AS avg_order_value
+            FROM {ANALYTICS_SCHEMA}.fct_orders
+            WHERE order_purchase_timestamp >= :start_date
+              AND order_purchase_timestamp < :end_date
+              AND order_status IN :valid_statuses
+            GROUP BY 1, date_trunc('month', order_purchase_timestamp)
+            ORDER BY date_trunc('month', order_purchase_timestamp);
+            """
+        ).bindparams(bindparam("valid_statuses", expanding=True))
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+            },
+        )
+
+    def analyze_quarterly_revenue(self, year: int, quarters: list[int] | None = None) -> pd.DataFrame:
+        valid_quarters = tuple(q for q in (quarters or [1, 2, 3, 4]) if 1 <= int(q) <= 4)
+        if not valid_quarters:
+            valid_quarters = (1, 2, 3, 4)
+        query = text(
+            f"""
+            SELECT
+                EXTRACT(QUARTER FROM order_purchase_timestamp)::int AS quarter,
+                ROUND(SUM(order_gross_value)::numeric, 2) AS revenue,
+                COUNT(DISTINCT order_id) AS order_count,
+                ROUND(AVG(order_gross_value)::numeric, 2) AS avg_order_value
+            FROM {ANALYTICS_SCHEMA}.fct_orders
+            WHERE order_purchase_timestamp >= :start_date
+              AND order_purchase_timestamp < :end_date
+              AND EXTRACT(QUARTER FROM order_purchase_timestamp)::int IN :quarters
+              AND order_status IN :valid_statuses
+            GROUP BY 1
+            ORDER BY 1;
+            """
+        ).bindparams(
+            bindparam("valid_statuses", expanding=True),
+            bindparam("quarters", expanding=True),
+        )
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+                "quarters": valid_quarters,
+            },
+        )
+
+    def analyze_delivery_review_impact(self, start_date: str, end_date: str) -> pd.DataFrame:
+        query = text(
+            f"""
+            SELECT
+                CASE WHEN is_delayed_delivery IS TRUE THEN 'delayed' ELSE 'on_time' END AS delivery_status,
+                COUNT(*) AS order_count,
+                ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score,
+                ROUND(AVG(delivery_days)::numeric, 2) AS avg_delivery_days,
+                ROUND(AVG(order_gross_value)::numeric, 2) AS avg_order_value
+            FROM {ANALYTICS_SCHEMA}.fct_orders
+            WHERE order_purchase_timestamp::date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
+              AND order_status = 'delivered'
+              AND review_score_avg IS NOT NULL
+            GROUP BY 1
+            ORDER BY delivery_status;
+            """
+        )
+        return pd.read_sql(query, self.engine, params={"start_date": start_date, "end_date": end_date})
+
+    def analyze_state_market_importance(self, year: int, top_n: int = 10) -> pd.DataFrame:
+        top_n = self.clamp_limit(top_n)
+        query = text(
+            f"""
+            WITH state_metrics AS (
+                SELECT
+                    customer_state AS state,
+                    SUM(order_gross_value)::numeric AS revenue,
+                    COUNT(DISTINCT order_id) AS order_count,
+                    COUNT(DISTINCT customer_unique_id) AS customer_count,
+                    ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score
+                FROM {ANALYTICS_SCHEMA}.fct_orders
+                WHERE order_purchase_timestamp >= :start_date
+                  AND order_purchase_timestamp < :end_date
+                  AND order_status IN :valid_statuses
+                  AND customer_state IS NOT NULL
+                GROUP BY 1
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN MAX(revenue) OVER () = MIN(revenue) OVER () THEN 1.0
+                        ELSE (revenue - MIN(revenue) OVER ()) / NULLIF(MAX(revenue) OVER () - MIN(revenue) OVER (), 0)
+                    END AS revenue_score,
+                    CASE
+                        WHEN MAX(order_count) OVER () = MIN(order_count) OVER () THEN 1.0
+                        ELSE (order_count - MIN(order_count) OVER ())::numeric
+                             / NULLIF(MAX(order_count) OVER () - MIN(order_count) OVER (), 0)
+                    END AS order_score,
+                    CASE
+                        WHEN MAX(customer_count) OVER () = MIN(customer_count) OVER () THEN 1.0
+                        ELSE (customer_count - MIN(customer_count) OVER ())::numeric
+                             / NULLIF(MAX(customer_count) OVER () - MIN(customer_count) OVER (), 0)
+                    END AS customer_score
+                FROM state_metrics
+            )
+            SELECT
+                state,
+                ROUND(revenue, 2) AS revenue,
+                order_count,
+                customer_count,
+                avg_review_score,
+                ROUND((0.4 * revenue_score + 0.3 * order_score + 0.3 * customer_score)::numeric, 4) AS importance_score
+            FROM scored
+            ORDER BY importance_score DESC, revenue DESC
+            LIMIT :top_n;
+            """
+        ).bindparams(bindparam("valid_statuses", expanding=True))
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+                "top_n": top_n,
+            },
+        )
+
+    def analyze_customer_experience_priority_categories(self, year: int, top_n: int = 10) -> pd.DataFrame:
+        top_n = self.clamp_limit(top_n)
+        query = text(
+            f"""
+            WITH category_metrics AS (
+                SELECT
+                    COALESCE(product_category_name_english, product_category_name, 'unknown') AS category,
+                    SUM(line_total)::numeric AS revenue,
+                    COUNT(DISTINCT order_id) AS order_count,
+                    ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score,
+                    ROUND(
+                        100.0 * COUNT(DISTINCT order_id) FILTER (
+                            WHERE order_delivered_customer_date > order_estimated_delivery_date
+                        ) / NULLIF(COUNT(DISTINCT order_id), 0),
+                        2
+                    ) AS delayed_order_rate_pct
+                FROM {ANALYTICS_SCHEMA}.fct_order_items
+                WHERE order_purchase_timestamp >= :start_date
+                  AND order_purchase_timestamp < :end_date
+                  AND order_status IN :valid_statuses
+                GROUP BY 1
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN MAX(order_count) OVER () = MIN(order_count) OVER () THEN 1.0
+                        ELSE (order_count - MIN(order_count) OVER ())::numeric
+                             / NULLIF(MAX(order_count) OVER () - MIN(order_count) OVER (), 0)
+                    END AS volume_score,
+                    CASE
+                        WHEN MAX(COALESCE(avg_review_score, 0)) OVER () = MIN(COALESCE(avg_review_score, 0)) OVER () THEN 0.0
+                        ELSE (MAX(COALESCE(avg_review_score, 0)) OVER () - COALESCE(avg_review_score, 0))
+                             / NULLIF(MAX(COALESCE(avg_review_score, 0)) OVER () - MIN(COALESCE(avg_review_score, 0)) OVER (), 0)
+                    END AS low_review_score,
+                    CASE
+                        WHEN MAX(COALESCE(delayed_order_rate_pct, 0)) OVER () = MIN(COALESCE(delayed_order_rate_pct, 0)) OVER () THEN 0.0
+                        ELSE (COALESCE(delayed_order_rate_pct, 0) - MIN(COALESCE(delayed_order_rate_pct, 0)) OVER ())
+                             / NULLIF(MAX(COALESCE(delayed_order_rate_pct, 0)) OVER () - MIN(COALESCE(delayed_order_rate_pct, 0)) OVER (), 0)
+                    END AS delay_score
+                FROM category_metrics
+            )
+            SELECT
+                category,
+                ROUND(revenue, 2) AS revenue,
+                order_count,
+                avg_review_score,
+                delayed_order_rate_pct,
+                ROUND((0.4 * volume_score + 0.3 * low_review_score + 0.3 * delay_score)::numeric, 4) AS priority_score
+            FROM scored
+            ORDER BY priority_score DESC, order_count DESC
+            LIMIT :top_n;
+            """
+        ).bindparams(bindparam("valid_statuses", expanding=True))
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+                "top_n": top_n,
+            },
+        )
+
+    def analyze_customer_experience_priority_states(self, year: int, top_n: int = 10) -> pd.DataFrame:
+        top_n = self.clamp_limit(top_n)
+        query = text(
+            f"""
+            WITH state_metrics AS (
+                SELECT
+                    customer_state AS state,
+                    SUM(order_gross_value)::numeric AS revenue,
+                    COUNT(DISTINCT order_id) AS order_count,
+                    ROUND(AVG(review_score_avg)::numeric, 2) AS avg_review_score,
+                    ROUND(
+                        100.0 * COUNT(*) FILTER (WHERE is_delayed_delivery IS TRUE) / NULLIF(COUNT(*), 0),
+                        2
+                    ) AS delayed_order_rate_pct
+                FROM {ANALYTICS_SCHEMA}.fct_orders
+                WHERE order_purchase_timestamp >= :start_date
+                  AND order_purchase_timestamp < :end_date
+                  AND order_status IN :valid_statuses
+                  AND customer_state IS NOT NULL
+                GROUP BY 1
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN MAX(order_count) OVER () = MIN(order_count) OVER () THEN 1.0
+                        ELSE (order_count - MIN(order_count) OVER ())::numeric
+                             / NULLIF(MAX(order_count) OVER () - MIN(order_count) OVER (), 0)
+                    END AS volume_score,
+                    CASE
+                        WHEN MAX(COALESCE(avg_review_score, 0)) OVER () = MIN(COALESCE(avg_review_score, 0)) OVER () THEN 0.0
+                        ELSE (MAX(COALESCE(avg_review_score, 0)) OVER () - COALESCE(avg_review_score, 0))
+                             / NULLIF(MAX(COALESCE(avg_review_score, 0)) OVER () - MIN(COALESCE(avg_review_score, 0)) OVER (), 0)
+                    END AS low_review_score,
+                    CASE
+                        WHEN MAX(COALESCE(delayed_order_rate_pct, 0)) OVER () = MIN(COALESCE(delayed_order_rate_pct, 0)) OVER () THEN 0.0
+                        ELSE (COALESCE(delayed_order_rate_pct, 0) - MIN(COALESCE(delayed_order_rate_pct, 0)) OVER ())
+                             / NULLIF(MAX(COALESCE(delayed_order_rate_pct, 0)) OVER () - MIN(COALESCE(delayed_order_rate_pct, 0)) OVER (), 0)
+                    END AS delay_score
+                FROM state_metrics
+            )
+            SELECT
+                state,
+                ROUND(revenue, 2) AS revenue,
+                order_count,
+                avg_review_score,
+                delayed_order_rate_pct,
+                ROUND((0.4 * volume_score + 0.3 * low_review_score + 0.3 * delay_score)::numeric, 4) AS priority_score
+            FROM scored
+            ORDER BY priority_score DESC, order_count DESC
+            LIMIT :top_n;
+            """
+        ).bindparams(bindparam("valid_statuses", expanding=True))
+        return pd.read_sql(
+            query,
+            self.engine,
+            params={
+                "start_date": f"{year}-01-01",
+                "end_date": f"{year + 1}-01-01",
+                "valid_statuses": VALID_REVENUE_STATUSES,
+                "top_n": top_n,
+            },
+        )
+
+    def analyze_customer_experience_priorities(self, year: int, top_n: int = 10) -> dict[str, Any]:
+        category_df = self.analyze_customer_experience_priority_categories(year, top_n)
+        state_df = self.analyze_customer_experience_priority_states(year, top_n)
+        return {
+            "year": year,
+            "top_n": top_n,
+            "categories": self.records(category_df),
+            "states": self.records(state_df),
+        }
+
     def generate_report(self, df: pd.DataFrame, title: str, chart_type: str = "bar", y_col: str = "total_sales"):
         if chart_type != "bar":
             raise ValueError("Only bar chart reports are currently supported.")
@@ -285,6 +686,62 @@ class OlistAgent:
             prompt,
             max_new_tokens=max_new_tokens or int(os.getenv("GEMMA_MAX_NEW_TOKENS", "120")),
         )
+
+    def generate_analysis_from_payload(
+        self,
+        question: str,
+        payload: dict[str, Any],
+        context: str = "",
+        max_new_tokens: int | None = None,
+    ) -> str:
+        self.ensure_gemma()
+        data_preview = json.dumps(payload, ensure_ascii=False, indent=2)
+        prompt = (
+            f"{self.load_system_prompt()}\n\n"
+            "Nhiem vu hien tai: Tra loi bang tieng Viet trong 3-6 cau ngan. "
+            "Chi duoc dung so lieu trong JSON hop le ben duoi. "
+            "Khong them chi so, bang, danh muc, bang/khu vuc, doanh thu, so don, ty le hay review khong co trong JSON. "
+            "Neu dua ra khuyen nghi, phai gan voi cac chi so co trong JSON.\n\n"
+            f"Cau hoi: {question}\n"
+            f"Ngu canh: {context}\n"
+            f"JSON hop le:\n{data_preview}\n\n"
+            "Cau tra loi:"
+        )
+        return self.gemma.generate_text(
+            prompt,
+            max_new_tokens=max_new_tokens or int(os.getenv("GEMMA_MAX_NEW_TOKENS", "160")),
+        )
+
+    def generate_analysis_or_fallback(
+        self,
+        question: str,
+        df: pd.DataFrame,
+        context: str,
+        fallback: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        try:
+            return self.generate_analysis(question, df, context=context, max_new_tokens=max_new_tokens)
+        except Exception:
+            return fallback
+
+    def generate_payload_analysis_or_fallback(
+        self,
+        question: str,
+        payload: dict[str, Any],
+        context: str,
+        fallback: str,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        try:
+            return self.generate_analysis_from_payload(
+                question,
+                payload,
+                context=context,
+                max_new_tokens=max_new_tokens,
+            )
+        except Exception:
+            return fallback
 
     def write_favorite_products_report(
         self,
@@ -336,9 +793,140 @@ class OlistAgent:
         intent = self.detect_intent(question)
         year = self.extract_year(question)
         top_n = self.extract_top_n(question)
+        normalized_question = self.normalize_text(question)
 
-        if self.extract_order_id(question) or "đơn hàng" in question.lower() or "order" in question.lower():
+        if self.extract_order_id(question) or "don hang" in normalized_question or "order" in normalized_question:
             return self.answer_order_question(question)
+
+        if intent == "category_performance":
+            df = self.analyze_category_performance(year=year, top_n=top_n)
+            safe_summary = self.safe_category_performance_analysis(df, year)
+            analysis = self.generate_analysis_or_fallback(
+                question,
+                df,
+                context=(
+                    f"Nam {year}; top_n={top_n}; diem tong hop = "
+                    "0.4*doanh thu + 0.4*so don + 0.2*review."
+                ),
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "year": year,
+                "top_n": top_n,
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "rows": self.records(df),
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
+
+        if intent == "monthly_revenue_extremes":
+            df = self.analyze_monthly_revenue_extremes(year=year)
+            safe_summary = self.safe_monthly_revenue_extremes_analysis(df, year)
+            analysis = self.generate_analysis_or_fallback(
+                question,
+                df,
+                context="So sanh thang doanh thu cao nhat, thap nhat va bat thuong dua tren revenue, order_count, avg_order_value.",
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "year": year,
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "rows": self.records(df),
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
+
+        if intent == "quarterly_revenue_comparison":
+            quarters = self.extract_quarters(question)
+            df = self.analyze_quarterly_revenue(year=year, quarters=quarters)
+            safe_summary = self.safe_quarterly_revenue_analysis(df, year)
+            analysis = self.generate_analysis_or_fallback(
+                question,
+                df,
+                context=f"Nam {year}; cac quy duoc hoi: {quarters or [1, 2, 3, 4]}.",
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "year": year,
+                "quarters": quarters or [1, 2, 3, 4],
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "rows": self.records(df),
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
+
+        if intent == "delivery_review_impact":
+            start_date, end_date = self.extract_date_range(question, year)
+            df = self.analyze_delivery_review_impact(start_date=start_date, end_date=end_date)
+            safe_summary = self.safe_delivery_review_impact_analysis(df, start_date, end_date)
+            analysis = self.generate_analysis_or_fallback(
+                question,
+                df,
+                context=f"Khoang ngay {start_date} den {end_date}; so sanh nhom giao tre va dung han.",
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "start_date": start_date,
+                "end_date": end_date,
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "rows": self.records(df),
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
+
+        if intent == "state_market_importance":
+            df = self.analyze_state_market_importance(year=year, top_n=top_n)
+            safe_summary = self.safe_state_market_importance_analysis(df, year)
+            analysis = self.generate_analysis_or_fallback(
+                question,
+                df,
+                context=(
+                    f"Nam {year}; top_n={top_n}; diem quan trong = "
+                    "0.4*doanh thu + 0.3*so don + 0.3*so khach hang."
+                ),
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "year": year,
+                "top_n": top_n,
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "rows": self.records(df),
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
+
+        if intent == "customer_experience_priority":
+            payload = self.analyze_customer_experience_priorities(year=year, top_n=top_n)
+            safe_summary = self.safe_customer_experience_priority_analysis(payload)
+            analysis = self.generate_payload_analysis_or_fallback(
+                question,
+                payload,
+                context=(
+                    "Uu tien cai thien trai nghiem dua tren noi co nhieu don, review thap, "
+                    "va ty le giao tre cao."
+                ),
+                fallback=safe_summary,
+            )
+            return {
+                "ok": True,
+                "intent": intent,
+                "year": year,
+                "top_n": top_n,
+                "model": os.getenv("GEMMA_MODEL", "google/gemma-2b-it"),
+                "data": payload,
+                "safe_summary": safe_summary,
+                "analysis": analysis,
+            }
 
         if intent == "top_products_by_orders":
             start_date, end_date = self.extract_date_range(question, year)
@@ -462,6 +1050,12 @@ class OlistAgent:
             "error": "Chua nhan dien duoc loai cau hoi.",
             "intent": intent,
             "supported_intents": [
+                "category_performance",
+                "monthly_revenue_extremes",
+                "quarterly_revenue_comparison",
+                "delivery_review_impact",
+                "state_market_importance",
+                "customer_experience_priority",
                 "top_products_by_orders",
                 "favorite_products",
                 "top_revenue_categories",
@@ -481,9 +1075,9 @@ class OlistAgent:
                 "error": "Bạn vui lòng cung cấp order_id."
             }
 
-        q = question.lower()
+        q = OlistAgent.normalize_text(question)
 
-        if "thanh toán" in q or "payment" in q:
+        if "thanh toan" in q or "payment" in q:
             df = self.analyze_order_payment(order_id)
             return {
             "ok": True,
@@ -492,7 +1086,7 @@ class OlistAgent:
             "payment": self.records(df)[0] if not df.empty else {},
         }
 
-        if "vận chuyển" in q or "giao hàng" in q or "phí ship" in q or "freight" in q:
+        if "van chuyen" in q or "giao hang" in q or "phi ship" in q or "freight" in q:
             df = self.analyze_order_shipping(order_id)
             return {
             "ok": True,
@@ -501,7 +1095,7 @@ class OlistAgent:
             "shipping": self.records(df)[0] if not df.empty else {},
         }
 
-        if "sản phẩm" in q or "product" in q:
+        if "san pham" in q or "product" in q:
             df = self.analyze_order_products(order_id)
             return {
             "ok": True,
@@ -510,7 +1104,7 @@ class OlistAgent:
             "products": self.records(df),
             }
 
-        if "người bán" in q or "seller" in q:
+        if "nguoi ban" in q or "seller" in q:
             df = self.analyze_order_sellers(order_id)
             return {
             "ok": True,
@@ -519,7 +1113,7 @@ class OlistAgent:
             "sellers": self.records(df),
             }
 
-        if "đánh giá" in q or "review" in q or "sao" in q:
+        if "danh gia" in q or "review" in q or "sao" in q:
             df = self.analyze_order_review(order_id)
             return {
             "ok": True,
@@ -528,7 +1122,7 @@ class OlistAgent:
             "review": self.records(df)[0] if not df.empty else {},
         }
 
-        if "khách hàng" in q or "customer" in q:
+        if "khach hang" in q or "customer" in q:
             df = self.analyze_order_customer(order_id)
             return {
             "ok": True,
@@ -746,6 +1340,92 @@ class OlistAgent:
             f"Tỷ lệ khách hàng quay lại là {row['repeat_customer_rate_pct']}%."
         )
 
+    def safe_category_performance_analysis(self, df: pd.DataFrame, year: int) -> str:
+        rows = self.records(df)
+        if not rows:
+            return f"Khong co du lieu danh muc san pham cho nam {year}."
+        first = rows[0]
+        return (
+            f"Nam {year}, danh muc co diem tong hop cao nhat la {first['category']} "
+            f"voi doanh thu {first['revenue']}, {first['order_count']} don hang, "
+            f"review trung binh {first['avg_review_score']} va diem {first['performance_score']}."
+        )
+
+    def safe_monthly_revenue_extremes_analysis(self, df: pd.DataFrame, year: int) -> str:
+        rows = self.records(df)
+        if not rows:
+            return f"Khong co du lieu doanh thu theo thang cho nam {year}."
+        highest = max(rows, key=lambda row: row["revenue"] or 0)
+        lowest = min(rows, key=lambda row: row["revenue"] or 0)
+        gap = (highest["revenue"] or 0) - (lowest["revenue"] or 0)
+        pct_gap = round(100.0 * gap / lowest["revenue"], 2) if lowest["revenue"] else None
+        suffix = f", cao hon {pct_gap}%" if pct_gap is not None else ""
+        return (
+            f"Nam {year}, thang doanh thu cao nhat la {highest['month']} voi {highest['revenue']} "
+            f"tren {highest['order_count']} don; thang thap nhat la {lowest['month']} voi "
+            f"{lowest['revenue']} tren {lowest['order_count']} don. Chenh lech tuyet doi la {gap}{suffix}."
+        )
+
+    def safe_quarterly_revenue_analysis(self, df: pd.DataFrame, year: int) -> str:
+        rows = self.records(df)
+        if not rows:
+            return f"Khong co du lieu doanh thu theo quy cho nam {year}."
+        highest = max(rows, key=lambda row: row["revenue"] or 0)
+        lowest = min(rows, key=lambda row: row["revenue"] or 0)
+        return (
+            f"Nam {year}, quy {highest['quarter']} co doanh thu cao nhat voi {highest['revenue']} "
+            f"va {highest['order_count']} don; quy {lowest['quarter']} thap nhat voi "
+            f"{lowest['revenue']} va {lowest['order_count']} don."
+        )
+
+    def safe_delivery_review_impact_analysis(self, df: pd.DataFrame, start_date: str, end_date: str) -> str:
+        rows = self.records(df)
+        if not rows:
+            return f"Khong co du lieu giao hang/review trong giai doan {start_date} den {end_date}."
+        by_status = {row["delivery_status"]: row for row in rows}
+        delayed = by_status.get("delayed")
+        on_time = by_status.get("on_time")
+        if not delayed or not on_time:
+            return f"Du lieu chi co {len(rows)} nhom giao hang trong giai doan {start_date} den {end_date}."
+        gap = round((on_time["avg_review_score"] or 0) - (delayed["avg_review_score"] or 0), 2)
+        return (
+            f"Tu {start_date} den {end_date}, nhom giao dung han co review trung binh "
+            f"{on_time['avg_review_score']} tren {on_time['order_count']} don; nhom giao tre co "
+            f"{delayed['avg_review_score']} tren {delayed['order_count']} don. Chenh lech review la {gap} diem."
+        )
+
+    def safe_state_market_importance_analysis(self, df: pd.DataFrame, year: int) -> str:
+        rows = self.records(df)
+        if not rows:
+            return f"Khong co du lieu thi truong theo bang cho nam {year}."
+        first = rows[0]
+        return (
+            f"Nam {year}, bang quan trong nhat la {first['state']} voi doanh thu {first['revenue']}, "
+            f"{first['order_count']} don, {first['customer_count']} khach hang va diem quan trong "
+            f"{first['importance_score']}."
+        )
+
+    def safe_customer_experience_priority_analysis(self, payload: dict[str, Any]) -> str:
+        categories = payload.get("categories") or []
+        states = payload.get("states") or []
+        year = payload.get("year")
+        if not categories and not states:
+            return f"Khong co du lieu uu tien cai thien trai nghiem cho nam {year}."
+        parts = []
+        if categories:
+            first_category = categories[0]
+            parts.append(
+                f"danh muc {first_category['category']} co diem uu tien {first_category['priority_score']}, "
+                f"review {first_category['avg_review_score']} va ty le giao tre {first_category['delayed_order_rate_pct']}%"
+            )
+        if states:
+            first_state = states[0]
+            parts.append(
+                f"bang {first_state['state']} co diem uu tien {first_state['priority_score']}, "
+                f"review {first_state['avg_review_score']} va ty le giao tre {first_state['delayed_order_rate_pct']}%"
+            )
+        return f"Nam {year}, nen uu tien " + "; dong thoi ".join(parts) + "."
+
     def ensure_gemma(self) -> None:
         if self.gemma is None:
             from model import GemmaModel
@@ -778,8 +1458,47 @@ class OlistAgent:
         return max(1, min(int(limit), maximum))
 
     @staticmethod
+    def normalize_text(text_value: str) -> str:
+        text_value = unicodedata.normalize("NFKD", text_value)
+        text_value = "".join(ch for ch in text_value if not unicodedata.combining(ch))
+        return text_value.lower()
+
+    @staticmethod
     def detect_intent(question: str) -> str:
-        q = question.lower()
+        q = OlistAgent.normalize_text(question)
+        has_revenue = "doanh thu" in q or "revenue" in q
+        if (
+            has_revenue
+            and ("quy" in q or re.search(r"\bq[1-4]\b", q))
+            and any(term in q for term in ["so sanh", "khac nhau", "chenh lech", "cao nhat", "thap nhat"])
+        ):
+            return "quarterly_revenue_comparison"
+        if (
+            ("danh muc" in q or "san pham" in q)
+            and has_revenue
+            and any(term in q for term in ["review", "danh gia", "so don"])
+        ):
+            return "category_performance"
+        if (
+            has_revenue
+            and "thang" in q
+            and any(term in q for term in ["cao nhat", "thap nhat", "bat thuong", "khac nhau", "so sanh"])
+        ):
+            return "monthly_revenue_extremes"
+        if (
+            "giao hang" in q
+            and any(term in q for term in ["tre", "cham", "delay"])
+            and any(term in q for term in ["danh gia", "review", "sao", "anh huong"])
+        ):
+            return "delivery_review_impact"
+        if (
+            ("bang" in q or "state" in q)
+            and any(term in q for term in ["thi truong", "market", "quan trong"])
+            and has_revenue
+        ):
+            return "state_market_importance"
+        if any(term in q for term in ["cai thien trai nghiem", "trai nghiem khach hang", "uu tien"]):
+            return "customer_experience_priority"
         if any(term in q for term in ["giao cham", "giao chậm", "tre", "trễ", "delay"]):
             return "delivery_delay"
         if any(
@@ -822,14 +1541,15 @@ class OlistAgent:
 
     @staticmethod
     def extract_top_n(question: str, default: int = 10) -> int:
-        match = re.search(r"\btop\s*(\d{1,2})\b", question.lower())
+        q = OlistAgent.normalize_text(question)
+        match = re.search(r"\btop\s*(\d{1,2})\b", q)
         if not match:
-            match = re.search(r"\b(\d{1,2})\s+(?:danh muc|danh mục|san pham|sản phẩm)", question.lower())
+            match = re.search(r"\b(\d{1,2})\s+(?:danh muc|san pham|bang|khu vuc|state)", q)
         return OlistAgent.clamp_limit(int(match.group(1)) if match else default)
 
     @staticmethod
     def extract_date_range(question: str, year: int) -> tuple[str, str]:
-        q = question.lower()
+        q = OlistAgent.normalize_text(question)
         if "quy 1" in q or "quý 1" in q or "q1" in q:
             return f"{year}-01-01", f"{year}-03-31"
         if "quy 2" in q or "quý 2" in q or "q2" in q:
@@ -839,6 +1559,12 @@ class OlistAgent:
         if "quy 4" in q or "quý 4" in q or "q4" in q:
             return f"{year}-10-01", f"{year}-12-31"
         return f"{year}-01-01", f"{year}-12-31"
+
+    @staticmethod
+    def extract_quarters(question: str) -> list[int]:
+        q = OlistAgent.normalize_text(question)
+        quarters = {int(match.group(1)) for match in re.finditer(r"\b(?:quy|q)\s*([1-4])\b", q)}
+        return sorted(quarters)
 
     @staticmethod
     def resolve_workspace_output_path(output_path: str) -> Path:

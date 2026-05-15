@@ -65,6 +65,26 @@ def call_agent_api(question: str, output_path: str = "") -> dict[str, Any]:
     return json.loads(body)
 
 
+def allow_agent_file_output(question: str, output_path: str) -> bool:
+    if not output_path:
+        return False
+    lowered = question.lower()
+    file_terms = [
+        "tao file",
+        "tạo file",
+        "tao bao cao",
+        "tạo báo cáo",
+        "xuat bao cao",
+        "xuất báo cáo",
+        "luu bao cao",
+        "lưu báo cáo",
+        "export",
+        "report file",
+        "html",
+    ]
+    return any(term in lowered for term in file_terms)
+
+
 def get_conn():
     return connect(
         host=PGHOST,
@@ -127,7 +147,7 @@ def explain_common_fix(error_text: str) -> str | None:
 
 @mcp.tool()
 def ping() -> dict[str, Any]:
-    """Health check for the MCP server and PostgreSQL connectivity."""
+    "Kiểm tra tình trạng hoạt động của máy chủ MCP và kết nối PostgreSQL."
     try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT current_database() AS db, current_user AS usr, version() AS version")
@@ -140,8 +160,18 @@ def ping() -> dict[str, Any]:
 
 @mcp.tool()
 def get_business_rules() -> dict[str, Any]:
-    """Return business definitions that the agent should follow for analytics."""
+    "Các định nghĩa nghiệp vụ"
     return make_agent().get_business_rules()
+
+
+@mcp.tool()
+def business_rules_agent(question: str) -> dict[str, Any]:
+    " Trả lời câu hỏi về các quy tắc nghiệp vụ"
+    try:
+        return make_agent().answer_business_rule_question(question)
+    except Exception as exc:
+        logging.exception("business_rules_agent failed")
+        return {"ok": False, "error": str(exc)}
 
 
 @mcp.prompt(
@@ -167,7 +197,7 @@ def olist_system_prompt_resource() -> str:
 
 @mcp.tool()
 def get_system_prompt() -> dict[str, Any]:
-    """Return the system prompt that should guide the Olist analytics agent."""
+    "Lời nhắc hệ thống cần thiết để hướng dẫn tác nhân phân tích"
     try:
         return make_agent().get_system_prompt_info()
     except Exception as exc:
@@ -177,7 +207,7 @@ def get_system_prompt() -> dict[str, Any]:
 
 @mcp.tool()
 def list_tables() -> dict[str, Any]:
-    """List all tables and views in the configured schema."""
+    "Liệt kê tất cả các bảng và chế độ xem trong lược đồ đã cấu hình."
     query = """
     SELECT table_name, table_type
     FROM information_schema.tables
@@ -192,7 +222,7 @@ def list_tables() -> dict[str, Any]:
 
 @mcp.tool()
 def describe_table(table_name: str) -> dict[str, Any]:
-    """Describe columns for a specific table or view in the configured schema."""
+    "Mô tả các cột cho một bảng hoặc chế độ xem cụ thể trong lược đồ đã cấu hình."
     if not is_safe_identifier(table_name):
         return {"ok": False, "error": "Invalid table name."}
 
@@ -228,7 +258,7 @@ def describe_table(table_name: str) -> dict[str, Any]:
 
 @mcp.tool()
 def sample_rows(table_name: str, limit: int = 5) -> dict[str, Any]:
-    """Return sample rows from a configured-schema table or view."""
+    "Trả về các hàng mẫu từ bảng hoặc chế độ xem có cấu hình lược đồ."
     if not is_safe_identifier(table_name):
         return {"ok": False, "error": "Invalid table name."}
     limit = max(1, min(limit, 20))
@@ -260,7 +290,7 @@ def sample_rows(table_name: str, limit: int = 5) -> dict[str, Any]:
 
 @mcp.tool()
 def get_schema_summary() -> dict[str, Any]:
-    """Return a concise schema summary for the configured schema."""
+    "Trả về bản tóm tắt lược đồ ngắn gọn cho lược đồ đã được cấu hình"
     object_query = """
     SELECT table_name, table_type
     FROM information_schema.tables
@@ -297,7 +327,7 @@ def get_schema_summary() -> dict[str, Any]:
 
 @mcp.tool()
 def validate_query(query: str) -> dict[str, Any]:
-    """Validate whether a SQL query is safe and read-only."""
+    "Kiểm tra xem truy vấn SQL có an toàn và chỉ đọc hay không"
     result = validate_select_query(query)
     result["normalized_query"] = query.strip().rstrip(";") if result["ok"] else None
     return result
@@ -305,7 +335,7 @@ def validate_query(query: str) -> dict[str, Any]:
 
 @mcp.tool()
 def run_select_query(query: str, row_limit: int = 100) -> dict[str, Any]:
-    """Run a read-only SQL query against PostgreSQL and return rows."""
+    "Chạy truy vấn SQL chỉ đọc trên PostgreSQL và trả về các hàng."
     row_limit = max(1, min(row_limit, MAX_RETURN_ROWS))
     validation = validate_select_query(query)
     if not validation["ok"]:
@@ -335,7 +365,7 @@ def run_select_query(query: str, row_limit: int = 100) -> dict[str, Any]:
 
 @mcp.tool()
 def revenue_by_month(year: int) -> dict[str, Any]:
-    """Return monthly gross revenue from analytics.fct_orders for a given year."""
+    "Doanh thu gộp hàng tháng từ analytics.fct_orders cho một năm cụ thể."
     try:
         agent = make_agent()
         df = agent.analyze_revenue_by_month(year)
@@ -347,7 +377,7 @@ def revenue_by_month(year: int) -> dict[str, Any]:
 
 @mcp.tool()
 def top_categories(start_date: str, end_date: str, limit: int = 10) -> dict[str, Any]:
-    """Return top product categories by gross revenue for a date range."""
+    "Các danh mục sản phẩm hàng đầu theo doanh thu gộp trong một khoảng thời gian nhất định.s"
     try:
         agent = make_agent()
         limit = agent.clamp_limit(limit)
@@ -361,7 +391,7 @@ def top_categories(start_date: str, end_date: str, limit: int = 10) -> dict[str,
 
 @mcp.tool()
 def delivery_delay_summary(start_date: str, end_date: str) -> dict[str, Any]:
-    """Return delivery delay metrics for delivered orders within a date range."""
+    "Số liệu thống kê về thời gian giao hàng trả lại đối với các đơn hàng đã giao trong một khoảng thời gian nhất định."
     try:
         agent = make_agent()
         df = agent.analyze_delivery_delay_summary(start_date, end_date)
@@ -375,7 +405,7 @@ def delivery_delay_summary(start_date: str, end_date: str) -> dict[str, Any]:
 
 @mcp.tool()
 def repeat_customer_rate(start_date: str, end_date: str) -> dict[str, Any]:
-    """Return repeat customer rate using customer_unique_id and order grain."""
+    "Tính toán tỷ lệ khách hàng quay lại dựa trên customer_unique_id và order grain."
     try:
         agent = make_agent()
         df = agent.analyze_repeat_customer_rate(start_date, end_date)
@@ -389,15 +419,36 @@ def repeat_customer_rate(start_date: str, end_date: str) -> dict[str, Any]:
 
 @mcp.tool()
 def gemma_runtime_status() -> dict[str, Any]:
-    """Return local Gemma runtime settings visible to the MCP server without loading the model."""
+    "Các thiết lập thời gian chạy cục bộ của Gemma hiển thị cho máy chủ MCP mà không cần tải mô hình."
     return make_agent().gemma_runtime_status()
 
 
 @mcp.tool()
-def gemma_agent(question: str, output_path: str = "") -> dict[str, Any]:
-    """Answer an Olist analytics question through the local long-running Gemma agent API."""
+def agent(question: str, output_path: str = "") -> dict[str, Any]:
+    "Trả lời các câu hỏi chính"
     try:
-        return call_agent_api(question=question, output_path=output_path)
+        requested_output_path = output_path
+        effective_output_path = output_path if allow_agent_file_output(question, output_path) else ""
+        result = call_agent_api(question=question, output_path=effective_output_path)
+        if isinstance(result, dict):
+            if requested_output_path and not effective_output_path:
+                result["ignored_output_path"] = requested_output_path
+                result["ignored_output_path_reason"] = (
+                    "output_path was ignored because the question did not explicitly ask agent.py to create/export a report file."
+                )
+            result.setdefault(
+                "workspace_policy",
+                {
+                    "handled_by": "agent.py",
+                    "caller_should_create_files": False,
+                    "caller_should_edit_files": False,
+                    "chat_only": not bool(effective_output_path),
+                    "file_output_rule": (
+                        "Only agent.py may create a report file, and only when output_path is provided."
+                    ),
+                },
+            )
+        return result
     except URLError as exc:
         logging.exception("Gemma agent API is unavailable")
         return {

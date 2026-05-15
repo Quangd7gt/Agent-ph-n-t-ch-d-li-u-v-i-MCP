@@ -11,7 +11,7 @@
         "PGPORT": "5432",
         "PGDATABASE": "olist_db",
         "PGUSER": "postgres",
-        "PGPASSWORD": "quang123",
+        "PGPASSWORD": "change_me",
         "MAX_RETURN_ROWS": "200",
         "DEFAULT_SCHEMA": "analytics"
       }
