@@ -46,7 +46,7 @@ def make_engine():
     return create_engine(url, future=True)
 
 
-class OlistAgent:
+class Agent:
     def __init__(self):
         self.engine = make_engine()
         self.gemma = None
@@ -1075,7 +1075,7 @@ class OlistAgent:
                 "error": "Bạn vui lòng cung cấp order_id."
             }
 
-        q = OlistAgent.normalize_text(question)
+        q = Agent.normalize_text(question)
 
         if "thanh toan" in q or "payment" in q:
             df = self.analyze_order_payment(order_id)
@@ -1465,7 +1465,7 @@ class OlistAgent:
 
     @staticmethod
     def detect_intent(question: str) -> str:
-        q = OlistAgent.normalize_text(question)
+        q = Agent.normalize_text(question)
         has_revenue = "doanh thu" in q or "revenue" in q
         if (
             has_revenue
@@ -1541,15 +1541,15 @@ class OlistAgent:
 
     @staticmethod
     def extract_top_n(question: str, default: int = 10) -> int:
-        q = OlistAgent.normalize_text(question)
+        q = Agent.normalize_text(question)
         match = re.search(r"\btop\s*(\d{1,2})\b", q)
         if not match:
             match = re.search(r"\b(\d{1,2})\s+(?:danh muc|san pham|bang|khu vuc|state)", q)
-        return OlistAgent.clamp_limit(int(match.group(1)) if match else default)
+        return Agent.clamp_limit(int(match.group(1)) if match else default)
 
     @staticmethod
     def extract_date_range(question: str, year: int) -> tuple[str, str]:
-        q = OlistAgent.normalize_text(question)
+        q = Agent.normalize_text(question)
         if "quy 1" in q or "quý 1" in q or "q1" in q:
             return f"{year}-01-01", f"{year}-03-31"
         if "quy 2" in q or "quý 2" in q or "q2" in q:
@@ -1562,7 +1562,7 @@ class OlistAgent:
 
     @staticmethod
     def extract_quarters(question: str) -> list[int]:
-        q = OlistAgent.normalize_text(question)
+        q = Agent.normalize_text(question)
         quarters = {int(match.group(1)) for match in re.finditer(r"\b(?:quy|q)\s*([1-4])\b", q)}
         return sorted(quarters)
 
@@ -1604,3 +1604,6 @@ class OlistAgent:
     def extract_order_id(question: str) -> str | None:
         match = re.search(r"\b[a-f0-9]{32}\b", question.lower())
         return match.group(0) if match else None
+
+
+OlistAgent = Agent

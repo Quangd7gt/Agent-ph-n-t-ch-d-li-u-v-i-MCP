@@ -8,12 +8,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from agent.agent import OlistAgent
+from agent.agent import Agent
 
 load_dotenv()
 
 app = FastAPI(title="Olist Gemma Agent API", version="1.0.0")
-agent = OlistAgent()
+agent = Agent()
 agent_lock = Lock()
 startup_error: str | None = None
 
