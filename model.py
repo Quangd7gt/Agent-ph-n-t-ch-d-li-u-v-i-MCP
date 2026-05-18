@@ -6,8 +6,32 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+DEAD_PROXY_VALUES = {
+    "http://127.0.0.1:9",
+    "https://127.0.0.1:9",
+    "http://localhost:9",
+    "https://localhost:9",
+}
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def clear_dead_proxy_env() -> None:
+    for key in PROXY_ENV_KEYS:
+        value = os.getenv(key)
+        if value and value.rstrip("/").lower() in DEAD_PROXY_VALUES:
+            os.environ.pop(key, None)
+
+
 class GemmaModel:
     def __init__(self, model_name: str = "google/gemma-2b-it"):
+        clear_dead_proxy_env()
         token = os.getenv("HUGGINGFACE_TOKEN") or None
         self.device = self._resolve_device(os.getenv("GEMMA_DEVICE", "auto"))
         torch_dtype = torch.float16 if self.device.type == "cuda" else torch.float32

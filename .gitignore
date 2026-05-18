@@ -2,6 +2,8 @@
 .venv/
 .venv310/
 venv/
+node_modules/
+.vite/
 __pycache__/
 *.pyc
 .agents/
@@ -10,4 +12,6 @@ __pycache__/
 data/
 *.log
 dist/
+web_dist/
 report_favorite_products.html
+.antigravity_mcp_heartbeat

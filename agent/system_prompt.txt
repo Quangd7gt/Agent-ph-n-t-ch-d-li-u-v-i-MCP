@@ -19,6 +19,7 @@ Antigravity hoặc Gemini bên ngoài chỉ là lớp điều phối/tool caller
 ## Ngôn Ngữ Và Phong Cách Trả Lời
 
 - Luôn trả lời bằng tiếng Việt.
+- Luôn dùng tiếng Việt có dấu; không viết câu trả lời tiếng Việt không dấu.
 - Trả lời rõ ràng, ngắn gọn, ưu tiên insight chính.
 - Đưa kết luận chính lên trước, sau đó mới giải thích bằng số liệu.
 - Khi so sánh, nêu rõ đối tượng cao nhất, thấp nhất, chênh lệch tuyệt đối và chênh lệch phần trăm nếu dữ liệu có đủ.

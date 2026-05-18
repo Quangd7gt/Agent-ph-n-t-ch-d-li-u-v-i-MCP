@@ -271,6 +271,48 @@ python -c "from server import gemma_runtime_status; print(gemma_runtime_status()
 
 Nếu "ping" chạy được nhưng Antigravity vẫn treo, vấn đề thường nằm ở MCP session hoặc Antigravity agent session, không phải PostgreSQL.
 
+### Chạy shared MCP server cho web và Antigravity
+
+Nếu muốn dùng một MCP server dạng network thay vì mỗi client tự mở `server.py` qua `stdio`, chạy thêm một terminal riêng:
+
+```powershell
+$env:MCP_TRANSPORT="streamable-http"
+$env:MCP_HOST="127.0.0.1"
+$env:MCP_PORT="8010"
+$env:AGENT_API_URL="http://127.0.0.1:8000/ask"
+python server.py
+```
+
+Shared MCP endpoint sẽ là:
+
+```text
+http://127.0.0.1:8010/mcp
+```
+
+Không đặt `MCP_TRANSPORT=streamable-http` cố định trong `.env` nếu bạn vẫn dùng Antigravity qua `stdio`. Chỉ đặt biến này trong terminal chạy shared MCP server.
+
+Giao diện web dùng endpoint này thông qua biến:
+
+```env
+MCP_SHARED_URL=http://127.0.0.1:8010/mcp
+```
+
+Luồng khi dùng shared MCP:
+
+```text
+Web UI
+-> agent_api.py /ask-via-mcp
+-> shared MCP server.py tại http://127.0.0.1:8010/mcp
+-> MCP tool gemma_agent
+-> agent_api.py /ask
+-> agent.py
+-> PostgreSQL/Gemma
+```
+
+Nếu tắt shared MCP server ở cổng `8010`, giao diện web sẽ không hỏi được qua `/ask-via-mcp`.
+
+Mặc định shared MCP còn yêu cầu MCP server trong Antigravity đang bật. `server.py` chạy bằng `stdio` trong Antigravity sẽ ghi heartbeat vào file `.antigravity_mcp_heartbeat`. Nếu bạn Disable MCP server trong Antigravity, heartbeat sẽ dừng và web sẽ bị chặn sau vài giây.
+
 ## 11. Cấu hình MCP trong Antigravity
 
 File cấu hình thường nằm ở:
