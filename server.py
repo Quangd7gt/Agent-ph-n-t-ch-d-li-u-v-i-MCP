@@ -722,6 +722,38 @@ def gemma_agent(question: str, output_path: str = "") -> dict[str, Any]:
     return agent(question=question, output_path=output_path)
 
 
+@mcp.tool()
+def verify_result(question: str, result_json: str) -> dict[str, Any]:
+    "Kiểm tra kết quả phân tích của Agent có chính xác không qua AI Verifier 5 lớp."
+    try:
+        result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        from agent.verifier_integration import verify_agent_result
+
+        enriched = verify_agent_result(make_agent().engine, question, result)
+        return {
+            "ok": True,
+            "verification": enriched.get("verification", {}),
+        }
+    except Exception as exc:
+        logging.exception("verify_result failed")
+        return {"ok": False, "error": safe_error_message(exc)}
+
+
+@mcp.tool()
+def verification_status() -> dict[str, Any]:
+    "Trạng thái bật/tắt AI Verifier."
+    import os as _os
+    from agent.verifier_integration import ENABLE_VERIFICATION
+
+    return {
+        "ok": True,
+        "enabled": ENABLE_VERIFICATION,
+        "cross_validate": _os.getenv("VERIFIER_CROSS_VALIDATE", "true").lower()
+        in {"1", "true", "yes", "on"},
+        "tolerance": float(_os.getenv("VERIFIER_CV_TOLERANCE", "0.01")),
+    }
+
+
 def main() -> None:
     global MCP_ACTIVE_TRANSPORT
     transport = os.getenv("MCP_TRANSPORT", "stdio")

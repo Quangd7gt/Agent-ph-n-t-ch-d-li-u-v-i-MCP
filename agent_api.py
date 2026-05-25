@@ -74,14 +74,53 @@ def title_from_question(question: str) -> str:
     return f"{clean[:54]}..." if len(clean) > 54 else clean
 
 
+def _looks_like_raw_json(text: str) -> bool:
+    """Kiểm tra xem text có phải JSON thô (bắt đầu bằng [ hoặc {)."""
+    if not text or not isinstance(text, str):
+        return False
+    trimmed = text.lstrip()
+    return len(trimmed) > 20 and trimmed[0] in ("[", "{")
+
+
+def _summarize_rows(result: dict[str, Any]) -> str:
+    """Tạo tóm tắt tiếng Việt từ rows khi không có analysis."""
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return ""
+    first = rows[0] if isinstance(rows[0], dict) else {}
+    if not first:
+        return f"Đã truy vấn được {len(rows)} dòng dữ liệu."
+
+    name = first.get("category") or first.get("state") or first.get("product_category_name") or first.get("month") or first.get("quarter") or ""
+    parts: list[str] = []
+    if name:
+        parts.append(f"Đứng đầu: {name}")
+    revenue = first.get("revenue")
+    if revenue is not None:
+        parts.append(f"doanh thu {revenue:,.2f}")
+    orders = first.get("order_count") or first.get("total_orders")
+    if orders is not None:
+        parts.append(f"{orders:,} đơn hàng")
+    review = first.get("avg_review_score")
+    if review is not None:
+        parts.append(f"review trung bình {review}")
+
+    if not parts:
+        return f"Đã truy vấn được {len(rows)} dòng dữ liệu."
+    return f"{', '.join(parts)}. Tổng cộng {len(rows)} dòng dữ liệu — xem bảng chi tiết bên dưới."
+
+
 def assistant_text_from_result(result: dict[str, Any]) -> str:
     result = sanitize_agent_result(result)
     if result.get("needs_clarification"):
         return result.get("clarifying_question") or result.get("reason") or "Cần bổ sung thông tin."
     for key in ("analysis", "answer", "safe_summary", "error", "text"):
         value = result.get(key)
-        if value:
+        if value and not _looks_like_raw_json(str(value)):
             return str(value)
+    summary = _summarize_rows(result)
+    if summary:
+        return summary
     if result.get("ok"):
         return "Đã nhận được kết quả từ agent."
     return "Không có dữ liệu trả lời."
@@ -340,52 +379,152 @@ def save_chat_exchange(
     return conversation
 
 
-def find_last_user_question_needing_clarification(conversation_id: str | None) -> str | None:
+def find_last_user_question_in_conversation(conversation_id: str | None, *, require_clarification: bool = False) -> str | None:
+    """Tìm câu hỏi cuối cùng của user trong cuộc trò chuyện.
+
+    Nếu require_clarification=True, chỉ trả về khi assistant yêu cầu clarification.
+    Nếu require_clarification=False, trả về câu hỏi gần nhất mà assistant đã trả lời thành công.
+    """
     if not conversation_id:
         return None
     conversation = get_conversation(conversation_id)
     if not conversation:
         return None
     messages = conversation.get("messages") or []
-    last_assistant = None
-    for message in reversed(messages):
-        if message.get("role") == "assistant":
-            last_assistant = message
-            break
-    if not last_assistant:
-        return None
-    payload = last_assistant.get("payload") or {}
-    if not isinstance(payload, dict) or not payload.get("needs_clarification"):
+    if not messages:
         return None
 
+    # Tìm cặp user→assistant cuối cùng
+    last_user_text: str | None = None
+    last_assistant_payload: dict | None = None
+
     for message in reversed(messages):
-        if message.get("role") == "user":
-            return str(message.get("text") or "").strip() or None
+        role = message.get("role")
+        if role == "assistant" and last_assistant_payload is None:
+            last_assistant_payload = message.get("payload") or {}
+        elif role == "user" and last_assistant_payload is not None:
+            last_user_text = str(message.get("text") or "").strip()
+            break
+
+    if not last_user_text:
+        return None
+
+    if require_clarification:
+        if isinstance(last_assistant_payload, dict) and last_assistant_payload.get("needs_clarification"):
+            return last_user_text
+        return None
+
+    # Chỉ trả về nếu assistant đã trả lời thành công (ok=True)
+    if isinstance(last_assistant_payload, dict) and last_assistant_payload.get("ok"):
+        return last_user_text
     return None
 
 
-def is_time_only_followup(question: str) -> bool:
+# Các mẫu follow-up tiếng Việt
+_FOLLOWUP_PATTERNS = [
+    # "còn năm 2017 thì sao", "còn 2017", "thế năm 2017", "vậy năm 2017"
+    r"(?:con|the|vay|nhu vay|nhu the|entao|roi)\s+(?:nam\s*)?20\d{2}",
+    # "còn quý 1 thì sao", "thế quý 2 năm 2017"
+    r"(?:con|the|vay|entao|roi)\s+(?:quy|qui|q)\s*[1-4]",
+    # "năm 2017 thì sao", "2017 thì thế nào"
+    r"(?:nam\s*)?20\d{2}\s+(?:thi\s+)?(?:sao|the\s*nao|nhu\s*the\s*nao)",
+    # Thuần thời gian ngắn: "2017", "năm 2017", "quý 1 năm 2017"
+    r"(?:nam\s*)?20\d{2}$",
+    r"(?:quy|qui|q)\s*[1-4](?:\s*nam\s*20\d{2})?$",
+    r"thang\s*(?:1[0-2]|0?[1-9])(?:\s*nam\s*20\d{2})?$",
+    r"20\d{2}-\d{2}-\d{2}\s*(?:den|toi|-)\s*20\d{2}-\d{2}-\d{2}$",
+]
+
+
+def is_followup_question(question: str) -> bool:
+    """Nhận diện câu hỏi follow-up mang ngữ cảnh thời gian."""
     normalized = normalize_text(question).strip()
-    return bool(
-        re.fullmatch(r"(?:nam\s*)?20\d{2}", normalized)
-        or re.fullmatch(r"(?:q|quy|qui)\s*[1-4](?:\s*nam\s*20\d{2})?", normalized)
-        or re.fullmatch(r"thang\s*(?:1[0-2]|0?[1-9])(?:\s*nam\s*20\d{2})?", normalized)
-        or re.fullmatch(r"20\d{2}-\d{2}-\d{2}\s*(?:den|toi|-)\s*20\d{2}-\d{2}-\d{2}", normalized)
-    )
+    # Loại bỏ dấu ? cuối
+    normalized = normalized.rstrip("?").strip()
+    return any(re.search(pattern, normalized) for pattern in _FOLLOWUP_PATTERNS)
+
+
+def _extract_time_from_followup(question: str) -> dict[str, str | None]:
+    """Trích xuất thông tin thời gian từ câu follow-up."""
+    normalized = normalize_text(question).strip().rstrip("?").strip()
+    result: dict[str, str | None] = {"year": None, "quarter": None, "month": None}
+
+    year_match = re.search(r"(20\d{2})", normalized)
+    if year_match:
+        result["year"] = year_match.group(1)
+
+    quarter_match = re.search(r"(?:quy|qui|q)\s*([1-4])", normalized)
+    if quarter_match:
+        result["quarter"] = quarter_match.group(1)
+
+    month_match = re.search(r"thang\s*(1[0-2]|0?[1-9])", normalized)
+    if month_match:
+        result["month"] = month_match.group(1)
+
+    return result
+
+
+def merge_followup_with_previous(previous_question: str, followup_question: str) -> str:
+    """Ghép câu follow-up vào câu hỏi trước bằng cách thay thế thời gian."""
+    time_info = _extract_time_from_followup(followup_question)
+
+    result = previous_question
+
+    if time_info["year"]:
+        # Thay năm cũ bằng năm mới
+        result = re.sub(r"(?:năm\s*)?20\d{2}", f"năm {time_info['year']}", result, count=1)
+        # Nếu không tìm thấy năm trong câu cũ, thêm vào cuối
+        if time_info["year"] not in result:
+            result = f"{result} năm {time_info['year']}"
+
+    if time_info["quarter"]:
+        quarter_replaced = re.sub(r"(?:quý|quy|qui|q)\s*[1-4]", f"quý {time_info['quarter']}", result, count=1)
+        if quarter_replaced != result:
+            result = quarter_replaced
+        else:
+            result = f"{result} quý {time_info['quarter']}"
+
+    if time_info["month"]:
+        month_replaced = re.sub(r"tháng\s*(?:1[0-2]|0?[1-9])", f"tháng {time_info['month']}", result, count=1)
+        if month_replaced != result:
+            result = month_replaced
+        else:
+            result = f"{result} tháng {time_info['month']}"
+
+    return result
 
 
 def resolve_followup_question(conversation_id: str | None, question: str) -> tuple[str, dict[str, Any] | None]:
-    if not is_time_only_followup(question):
+    """Giải quyết câu hỏi follow-up bằng cách ghép với câu hỏi trước.
+
+    Ví dụ:
+      Câu trước: "tỷ lệ khách hàng quay lại năm 2018 là bao nhiêu?"
+      Follow-up: "còn năm 2017 thì sao"
+      → Resolved: "tỷ lệ khách hàng quay lại năm 2017 là bao nhiêu?"
+    """
+    if not is_followup_question(question):
         return question, None
-    previous_question = find_last_user_question_needing_clarification(conversation_id)
-    if not previous_question:
+
+    # Ưu tiên tìm câu hỏi cần clarification trước
+    previous = find_last_user_question_in_conversation(conversation_id, require_clarification=True)
+    resolution_type = "merged_with_previous_question_after_clarification"
+
+    # Nếu không có, tìm câu hỏi thành công gần nhất
+    if not previous:
+        previous = find_last_user_question_in_conversation(conversation_id, require_clarification=False)
+        resolution_type = "merged_with_previous_successful_question"
+
+    if not previous:
         return question, None
-    resolved = f"{previous_question} {question}"
+
+    resolved = merge_followup_with_previous(previous, question)
     return resolved, {
         "original_question": question,
+        "previous_question": previous,
         "resolved_question": resolved,
-        "followup_resolution": "merged_with_previous_question_after_clarification",
+        "followup_resolution": resolution_type,
     }
+
 
 
 def mcp_result_payload(result: Any) -> Any:
@@ -763,6 +902,37 @@ async def ask_via_mcp(payload: AskRequest, request: Request) -> dict[str, Any]:
 @app.get("/mcp-status")
 async def mcp_status() -> dict[str, Any]:
     return await call_mcp_tool("ping", {})
+
+
+class VerifyRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    result: dict[str, Any]
+
+
+@app.post("/verify")
+def verify(request: VerifyRequest) -> dict[str, Any]:
+    """Kiểm tra kết quả phân tích của Agent qua AI Verifier."""
+    from agent.verifier_integration import verify_agent_result
+
+    enriched = verify_agent_result(agent.engine, request.question, request.result)
+    return {
+        "ok": True,
+        "verification": enriched.get("verification", {}),
+    }
+
+
+@app.get("/verification-status")
+def verification_status() -> dict[str, Any]:
+    """Trạng thái bật/tắt AI Verifier."""
+    from agent.verifier_integration import ENABLE_VERIFICATION
+
+    return {
+        "ok": True,
+        "enabled": ENABLE_VERIFICATION,
+        "cross_validate": os.getenv("VERIFIER_CROSS_VALIDATE", "true").lower()
+        in {"1", "true", "yes", "on"},
+        "tolerance": float(os.getenv("VERIFIER_CV_TOLERANCE", "0.01")),
+    }
 
 
 if __name__ == "__main__":

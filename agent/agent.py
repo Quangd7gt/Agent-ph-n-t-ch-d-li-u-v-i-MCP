@@ -1084,7 +1084,10 @@ class Agent:
         normalized_question = understanding.normalized_question
 
         def finalize(result: dict[str, Any]) -> dict[str, Any]:
-            return self.attach_understanding(result, understanding)
+            result = self.attach_understanding(result, understanding)
+            # AI Verifier: kiểm tra kết quả trước khi trả về
+            from agent.verifier_integration import verify_agent_result
+            return verify_agent_result(self.engine, question, result)
 
         if intent == "schema_tables":
             df = self.list_data_tables()

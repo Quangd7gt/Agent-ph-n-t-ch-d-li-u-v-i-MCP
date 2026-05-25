@@ -16,6 +16,8 @@ export default defineConfig({
       "/ask-via-mcp": "http://127.0.0.1:8000",
       "/conversations": "http://127.0.0.1:8000",
       "/mcp-status": "http://127.0.0.1:8000",
+      "/verify": "http://127.0.0.1:8000",
+      "/verification-status": "http://127.0.0.1:8000",
       "/status": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000"
     }

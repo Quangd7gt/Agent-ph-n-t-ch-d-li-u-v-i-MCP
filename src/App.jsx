@@ -1,6 +1,7 @@
 import {
   ArrowUp,
   BarChart3,
+  ChevronDown,
   CreditCard,
   Menu,
   Package,
@@ -8,6 +9,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  ShieldCheck,
   Square,
   TrendingUp,
   Trash2,
@@ -81,16 +83,44 @@ function looksLikeBadAnalysis(text) {
   return /(?:\*\*)?\s*(?:cảnh|canh|kịch\s*bản|kich\s*ban)\s*\d+|câu\s*hỏi\s*phân\s*tích\s*dữ\s*liệu|cau\s*hoi\s*phan\s*tich\s*du\s*lieu|phân\s*tích\s*5\s*danh\s*mục\s*sản\s*phẩm\s*tốt\s*nhất|phan\s*tich\s*5\s*danh\s*muc\s*san\s*pham\s*tot\s*nhat/i.test(String(text || ""));
 }
 
+function looksLikeRawJson(text) {
+  if (!text || typeof text !== "string") return false;
+  const trimmed = text.trimStart();
+  return (trimmed.startsWith("[") || trimmed.startsWith("{")) && trimmed.length > 20;
+}
+
+function summarizeRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const first = rows[0];
+  if (!first || typeof first !== "object") return null;
+
+  const name = first.category || first.state || first.product_category_name || first.month || first.quarter;
+  const revenue = first.revenue;
+  const orderCount = first.order_count || first.total_orders;
+  const review = first.avg_review_score;
+
+  const parts = [];
+  if (name) parts.push(`Đứng đầu: ${name}`);
+  if (revenue != null) parts.push(`doanh thu ${formatNumber(revenue)}`);
+  if (orderCount != null) parts.push(`${formatNumber(orderCount)} đơn hàng`);
+  if (review != null) parts.push(`review trung bình ${review}`);
+
+  if (!parts.length) return `Đã truy vấn được ${rows.length} dòng dữ liệu. Xem bảng kết quả bên dưới.`;
+  return `${parts.join(", ")}. Tổng cộng ${rows.length} dòng dữ liệu — xem bảng chi tiết bên dưới.`;
+}
+
 function answerText(result) {
   if (!result) return "";
   if (result.needs_clarification) {
     return result.clarifying_question || result.reason || "Cần bổ sung thông tin.";
   }
-  if (result.analysis && !(result.safe_summary && looksLikeBadAnalysis(result.analysis))) return result.analysis;
-  if (result.answer) return result.answer;
-  if (result.safe_summary) return result.safe_summary;
+  if (result.analysis && !looksLikeRawJson(result.analysis) && !(result.safe_summary && looksLikeBadAnalysis(result.analysis))) return result.analysis;
+  if (result.answer && !looksLikeRawJson(result.answer)) return result.answer;
+  if (result.safe_summary && !looksLikeRawJson(result.safe_summary)) return result.safe_summary;
   if (result.error) return result.error;
-  if (result.text) return result.text;
+  if (result.text && !looksLikeRawJson(result.text)) return result.text;
+  const summary = summarizeRows(result.rows);
+  if (summary) return summary;
   if (result.ok) return "Đã nhận được kết quả từ agent.";
   return "Không có dữ liệu trả lời.";
 }
@@ -119,15 +149,18 @@ function resultTables(result) {
 
 function normalizeMessage(message) {
   const payload = message.payload || null;
-  const text = payload && message.role === "assistant" && looksLikeBadAnalysis(message.text)
-    ? answerText(payload)
-    : message.text || "";
+  const shouldReExtract =
+    payload &&
+    message.role === "assistant" &&
+    (looksLikeBadAnalysis(message.text) || looksLikeRawJson(message.text));
+  const text = shouldReExtract ? answerText(payload) : message.text || "";
   return {
     id: message.id || createId(),
     role: message.role,
     text,
     payload,
     tables: message.tables || resultTables(payload),
+    verification: message.verification || payload?.verification || null,
     error: message.error || (message.role === "assistant" && payload && !payload.ok && Boolean(payload.error)),
     loading: Boolean(message.loading)
   };
@@ -215,6 +248,113 @@ function DataTable({ title, rows }) {
   );
 }
 
+function VerificationBadge({ verification }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!verification || verification.passed === null || verification.passed === undefined) return null;
+
+  const passed = verification.passed;
+  const confidence = typeof verification.confidence === "number" ? verification.confidence : null;
+  const checks = Array.isArray(verification.checks) ? verification.checks : [];
+  const passedCount = verification.passed_checks ?? checks.filter((c) => c.passed).length;
+  const totalCount = verification.total_checks ?? checks.length;
+
+  const layers = {};
+  for (const check of checks) {
+    const layer = check.layer || "other";
+    if (!layers[layer]) layers[layer] = [];
+    layers[layer].push(check);
+  }
+
+  const layerLabels = {
+    structure: "Cấu trúc kết quả",
+    data_integrity: "Toàn vẹn dữ liệu",
+    business_rules: "Quy tắc nghiệp vụ",
+    analysis_quality: "Chất lượng phân tích",
+    cross_validation: "Đối chiếu chéo"
+  };
+
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+          passed
+            ? "border-emerald-700/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-950/60"
+            : "border-red-700/50 bg-red-950/40 text-red-300 hover:bg-red-950/60"
+        }`}
+        onClick={() => setExpanded(!expanded)}
+      >
+        <ShieldCheck size={14} />
+        <span>{passed ? "Verified" : "Issues found"}</span>
+        {confidence !== null && (
+          <span className="opacity-70">{Math.round(confidence * 100)}%</span>
+        )}
+        <span className="opacity-50">({passedCount}/{totalCount})</span>
+        <ChevronDown
+          size={12}
+          className={`transition-transform ${expanded ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {expanded && (
+        <div className="mt-2 rounded-ui border border-line bg-[#0d0d0d] text-sm">
+          <div className="border-b border-line px-3 py-2 font-semibold text-zinc-200">
+            AI Verification Report
+          </div>
+          <div className="divide-y divide-[#1a1a1a]">
+            {Object.entries(layers).map(([layer, layerChecks]) => (
+              <div key={layer} className="px-3 py-2">
+                <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-zinc-400">
+                  {layerLabels[layer] || layer}
+                </div>
+                <div className="grid gap-1">
+                  {layerChecks.map((check, index) => (
+                    <div
+                      key={`${check.check_name}-${index}`}
+                      className="flex items-start gap-2 text-xs leading-relaxed"
+                    >
+                      <span className="mt-0.5 shrink-0">
+                        {check.passed ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : check.severity === "error" ? (
+                          <span className="text-red-400">✗</span>
+                        ) : (
+                          <span className="text-yellow-400">⚠</span>
+                        )}
+                      </span>
+                      <div className="min-w-0">
+                        <span
+                          className={`${
+                            check.passed
+                              ? "text-zinc-400"
+                              : check.severity === "error"
+                              ? "text-red-300"
+                              : "text-yellow-300"
+                          }`}
+                        >
+                          {check.message || check.check_name}
+                        </span>
+                        {!check.passed && check.expected !== null && check.expected !== undefined && (
+                          <div className="mt-0.5 text-zinc-500">
+                            Kỳ vọng: <span className="text-zinc-400">{JSON.stringify(check.expected)}</span>
+                            {" → "}
+                            Thực tế: <span className="text-zinc-400">{JSON.stringify(check.actual)}</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Message({ message }) {
   const isUser = message.role === "user";
 
@@ -235,6 +375,9 @@ function Message({ message }) {
             {(message.tables || []).map((table, index) => (
               <DataTable key={`${table.title}-${index}`} title={table.title} rows={table.rows} />
             ))}
+            {!isUser && message.verification && (
+              <VerificationBadge verification={message.verification} />
+            )}
           </>
         )}
       </div>
